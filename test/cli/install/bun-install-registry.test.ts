@@ -2657,6 +2657,81 @@ describe("binaries", () => {
     }
   });
 
+  test("global remove cleans up bin files and node_modules", async () => {
+    await write(
+      join(packageDir, "bunfig.toml"),
+      `
+      [install]
+      cache = false
+      registry = "http://localhost:${port}/"
+      globalBinDir = "${join(packageDir, "global-bin-dir").replace(/\\/g, "\\\\")}"
+      `,
+    );
+
+    // First, install what-bin globally
+    let { stdout, stderr, exited } = spawn({
+      cmd: [bunExe(), "i", "--linker=hoisted", "-g", `--config=${join(packageDir, "bunfig.toml")}`, "what-bin"],
+      cwd: packageDir,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...env, BUN_INSTALL: join(packageDir, "global-install-dir") },
+    });
+
+    let err = await stderr.text();
+    expect(err).not.toContain("error:");
+    let out = await stdout.text();
+    expect(out).toContain("what-bin@1.5.0");
+    expect(await exited).toBe(0);
+
+    // Verify bin files were created
+    if (isWindows) {
+      expect(
+        await Promise.all([
+          exists(join(packageDir, "global-bin-dir", "what-bin.exe")),
+          exists(join(packageDir, "global-bin-dir", "what-bin.bunx")),
+        ]),
+      ).toEqual([true, true]);
+    } else {
+      expect(await exists(join(packageDir, "global-bin-dir", "what-bin"))).toBeTrue();
+    }
+
+    // Verify node_modules was created
+    expect(
+      await exists(join(packageDir, "global-install-dir", "install", "global", "node_modules", "what-bin")),
+    ).toBeTrue();
+
+    // Now remove the package globally
+    ({ stdout, stderr, exited } = spawn({
+      cmd: [bunExe(), "remove", "-g", `--config=${join(packageDir, "bunfig.toml")}`, "what-bin"],
+      cwd: packageDir,
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...env, BUN_INSTALL: join(packageDir, "global-install-dir") },
+    }));
+
+    err = await stderr.text();
+    expect(err).not.toContain("error:");
+    out = await stdout.text();
+    expect(await exited).toBe(0);
+
+    // Verify bin files were cleaned up
+    if (isWindows) {
+      expect(
+        await Promise.all([
+          exists(join(packageDir, "global-bin-dir", "what-bin.exe")),
+          exists(join(packageDir, "global-bin-dir", "what-bin.bunx")),
+        ]),
+      ).toEqual([false, false]);
+    } else {
+      expect(await exists(join(packageDir, "global-bin-dir", "what-bin"))).toBeFalse();
+    }
+
+    // Verify node_modules was cleaned up
+    expect(
+      await exists(join(packageDir, "global-install-dir", "install", "global", "node_modules", "what-bin")),
+    ).toBeFalse();
+  });
+
   for (const global of [false, true]) {
     test(`bin types${global ? " (global)" : ""}`, async () => {
       if (global) {

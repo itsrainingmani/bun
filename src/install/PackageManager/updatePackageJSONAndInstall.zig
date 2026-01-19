@@ -450,8 +450,8 @@ fn updatePackageJSONAndInstallWithManagerWithUpdates(
                 }
             }
 
-            // This is where we clean dangling symlinks
-            // This could be slow if there are a lot of symlinks
+            // This is where we clean dangling symlinks (Unix) or shims (Windows)
+            // This could be slow if there are a lot of entries
             if (bun.openDir(cwd, manager.options.bin_path)) |node_modules_bin_handle| {
                 var node_modules_bin: std.fs.Dir = node_modules_bin_handle;
                 defer node_modules_bin.close();
@@ -459,8 +459,7 @@ fn updatePackageJSONAndInstallWithManagerWithUpdates(
                 iterator: while (iter.next() catch null) |entry| {
                     switch (entry.kind) {
                         std.fs.Dir.Entry.Kind.sym_link => {
-
-                            // any symlinks which we are unable to open are assumed to be dangling
+                            // Unix: any symlinks which we are unable to open are assumed to be dangling
                             // note that using access won't work here, because access doesn't resolve symlinks
                             bun.copy(u8, &node_modules_buf, entry.name);
                             node_modules_buf[entry.name.len] = 0;
@@ -472,6 +471,83 @@ fn updatePackageJSONAndInstallWithManagerWithUpdates(
                             };
 
                             file.close();
+                        },
+                        std.fs.Dir.Entry.Kind.file => {
+                            // Windows: check .bunx shim files to see if their targets still exist
+                            if (comptime !Environment.isWindows) {
+                                continue :iterator;
+                            }
+
+                            // Only process .bunx files, skip .exe (they're handled together with .bunx)
+                            if (!strings.hasSuffixComptime(entry.name, ".bunx")) {
+                                continue :iterator;
+                            }
+
+                            // Read and parse the .bunx file to get the target path
+                            bun.copy(u8, &node_modules_buf, entry.name);
+                            node_modules_buf[entry.name.len] = 0;
+                            const bunx_name: [:0]u8 = node_modules_buf[0..entry.name.len :0];
+
+                            const bunx_file = node_modules_bin.openFileZ(bunx_name, .{ .mode = .read_only }) catch {
+                                continue :iterator;
+                            };
+
+                            const bunx_contents = contents: {
+                                defer bunx_file.close();
+                                var bunx_buf: [65536]u8 = undefined;
+                                const bytes_read = bunx_file.reader().readAll(&bunx_buf) catch {
+                                    continue :iterator;
+                                };
+                                break :contents bunx_buf[0..bytes_read];
+                            };
+
+                            const decoded = BinLinkingShim.looseDecode(bunx_contents) orelse {
+                                // Corrupted or invalid .bunx file, skip
+                                continue :iterator;
+                            };
+
+                            // Convert UTF-16 bin_path to UTF-8 and check if target exists
+                            // The bin_path is relative to the parent of the bin directory
+                            var target_path_buf: bun.PathBuffer = undefined;
+                            target_path_buf[0] = '.';
+                            target_path_buf[1] = '.';
+                            target_path_buf[2] = std.fs.path.sep;
+
+                            const bin_path_utf8_len = bun.simdutf.convert.utf16.to.utf8.le(
+                                decoded.bin_path,
+                                target_path_buf[3..],
+                            );
+                            if (bin_path_utf8_len == 0) {
+                                continue :iterator;
+                            }
+
+                            target_path_buf[3 + bin_path_utf8_len] = 0;
+                            const target_path: [:0]u8 = target_path_buf[0 .. 3 + bin_path_utf8_len :0];
+
+                            // Try to check if the target exists relative to the bin directory
+                            const target_exists = target_exists: {
+                                var target_file = node_modules_bin.openFileZ(target_path, .{ .mode = .read_only }) catch {
+                                    break :target_exists false;
+                                };
+                                target_file.close();
+                                break :target_exists true;
+                            };
+
+                            if (!target_exists) {
+                                // Target doesn't exist - delete both .bunx and .exe files
+                                // Get base name by stripping .bunx extension
+                                const base_name_len = entry.name.len - ".bunx".len;
+
+                                // Delete .bunx file
+                                node_modules_bin.deleteFileZ(bunx_name) catch {};
+
+                                // Delete corresponding .exe file
+                                bun.copy(u8, &node_modules_buf, entry.name[0..base_name_len]);
+                                bun.copy(u8, node_modules_buf[base_name_len..], ".exe");
+                                node_modules_buf[base_name_len + ".exe".len] = 0;
+                                const exe_name: [:0]u8 = node_modules_buf[0 .. base_name_len + ".exe".len :0];
+                                node_modules_bin.deleteFileZ(exe_name) catch {};
+                            }
                         },
                         else => {},
                     }
@@ -759,3 +835,4 @@ const PatchCommitResult = PackageManager.PatchCommitResult;
 const Subcommand = PackageManager.Subcommand;
 const UpdateRequest = PackageManager.UpdateRequest;
 const attemptToCreatePackageJSON = PackageManager.attemptToCreatePackageJSON;
+const BinLinkingShim = @import("../windows-shim/BinLinkingShim.zig");
